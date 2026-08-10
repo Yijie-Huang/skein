@@ -186,7 +186,7 @@ cython_debug/
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 
 # Ruff stuff:
 .ruff_cache/
@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Skein-specific
+.env
+*.trace.json
+.skein_cache/
+
+# Local scratch space and trace/run exports
+tmp/
+*.jsonl
+
+# Agent tooling local config (do not rely on a global gitignore for this)
+.claude/settings.local.json
