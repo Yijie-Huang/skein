@@ -1,0 +1,324 @@
+"""Graph execution engine for agentic workflows."""
+
+from __future__ import annotations
+
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime
+import importlib
+import inspect
+import os
+from typing import Any, Iterator
+
+from .state import BaseState, GraphStatus
+from .node import Node, NodeFunction
+from .trace import TraceEvent, TaskStatus, langsmith_tracing_enabled
+from ..exporters.base import Exporter, NoOpExporter
+from ..logging_config import get_logger
+
+logger = get_logger(__name__) 
+
+_STATE_SYSTEM_FIELDS = {"trace_id", "created_at", "current_node", "status"}
+
+
+def _serialize_trace_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", exclude_none=True)
+    if isinstance(value, dict):
+        return {str(key): _serialize_trace_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_serialize_trace_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_serialize_trace_payload(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _summarize_state(state: BaseState) -> dict[str, Any]:
+    state_payload = _serialize_trace_payload(state)
+    summary: dict[str, Any] = {
+        "trace_id": state_payload.get("trace_id"),
+        "current_node": state_payload.get("current_node"),
+        "status": state_payload.get("status"),
+    }
+    domain_state = {
+        key: value
+        for key, value in state_payload.items()
+        if key not in _STATE_SYSTEM_FIELDS and value is not None
+    }
+    if domain_state:
+        summary["state"] = domain_state
+    return summary
+
+
+def _summarize_state_delta(before: BaseState, after: BaseState) -> dict[str, Any]:
+    before_summary = _summarize_state(before)
+    after_summary = _summarize_state(after)
+    changed_fields = sorted(
+        key
+        for key in set(before_summary) | set(after_summary)
+        if before_summary.get(key) != after_summary.get(key)
+    )
+    delta: dict[str, Any] = {"changed_fields": changed_fields}
+    if "state" in after_summary:
+        delta["state"] = after_summary["state"]
+    delta["status"] = after_summary.get("status")
+    delta["current_node"] = after_summary.get("current_node")
+    return delta
+
+
+async def _invoke_node(node: Node | NodeFunction, state: BaseState) -> BaseState:
+    """Run either a Node instance or a bare async NodeFunction."""
+    if isinstance(node, Node):
+        return await node.run(state)
+    return await node(state)
+
+
+def _load_langsmith_trace() -> Any:
+    try:
+        langsmith_module = importlib.import_module("langsmith")
+    except ImportError:
+        return None
+    return getattr(langsmith_module, "trace", None)
+
+
+def _load_langsmith_tracing_context() -> Any:
+    try:
+        run_helpers_module = importlib.import_module("langsmith.run_helpers")
+    except ImportError:
+        return None
+    return getattr(run_helpers_module, "tracing_context", None)
+
+
+def _load_langsmith_client() -> Any:
+    try:
+        langsmith_module = importlib.import_module("langsmith")
+    except ImportError:
+        return None
+    client_cls = getattr(langsmith_module, "Client", None)
+    if client_cls is None:
+        return None
+    try:
+        return client_cls()
+    except Exception:
+        logger.warning("Failed to initialize LangSmith client", exc_info=True)
+        return None
+
+
+_LANGSMITH_TRACING_CONTEXT = _load_langsmith_tracing_context()
+_UNSET = object()
+_LANGSMITH_CLIENT: Any = _UNSET
+
+
+def _get_langsmith_client() -> Any:
+    """Return the process-wide LangSmith client, creating it at most once."""
+    global _LANGSMITH_CLIENT
+    if _LANGSMITH_CLIENT is _UNSET:
+        _LANGSMITH_CLIENT = _load_langsmith_client()
+    return _LANGSMITH_CLIENT
+
+
+@contextmanager
+def _maybe_langsmith_trace(
+    name: str,
+    run_type: str,
+    inputs: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Iterator[Any]:
+    if not langsmith_tracing_enabled():
+        yield None
+        return
+
+    trace_fn = _load_langsmith_trace()
+    tracing_context_fn = _LANGSMITH_TRACING_CONTEXT
+    if trace_fn is None or tracing_context_fn is None:
+        yield None
+        return
+
+    client = _get_langsmith_client()
+    project_name = os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT")
+    with tracing_context_fn(
+        enabled=True,
+        client=client,
+        project_name=project_name,
+    ):
+        with trace_fn(
+            name,
+            run_type=run_type,
+            inputs=inputs,
+            metadata=metadata,
+            client=client,
+            project_name=project_name,
+        ) as run:
+            yield run
+
+
+async def _flush_langsmith() -> None:
+    if not langsmith_tracing_enabled():
+        return
+
+    client = _get_langsmith_client()
+    if client is None:
+        return
+
+    flush = getattr(client, "flush", None)
+    if flush is None:
+        return
+
+    try:
+        result = flush()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.warning("Failed to flush LangSmith traces", exc_info=True)
+
+
+class Graph:
+    """Directed acyclic graph for composing nodes into workflows."""
+
+    def __init__(self, name: str, exporter: Exporter | None = None):
+        self.name = name
+        self.nodes: dict[str, Node | NodeFunction] = {}
+        self.edges: dict[str, list[str]] = {}
+        self.entry_point: str | None = None
+        self.exporter: Exporter = exporter or NoOpExporter()
+
+    def add_node(self, name: str, node: Node | NodeFunction) -> Graph:
+        """Add a node to the graph — either a Node instance or an async NodeFunction."""
+        if name in self.nodes:
+            raise ValueError(f"Node {name} already exists in the graph.")
+        if not isinstance(node, Node) and not callable(node):
+            raise TypeError(f"Node {name} must be a Node instance or an async callable.")
+        self.nodes[name] = node
+        self.edges[name] = []
+        return self
+
+    def add_edge(self, from_node: str, to_node: str) -> Graph:
+        if from_node not in self.nodes or to_node not in self.nodes:
+            raise ValueError("Both nodes must be added to the graph before connecting.")
+        self.edges[from_node].append(to_node)
+        return self
+    
+    def set_entry_point(self, name: str) -> Graph:
+        if name not in self.nodes:
+            raise ValueError(f"Node {name} not in graph.")
+        self.entry_point = name
+        return self
+    
+    async def run(self, initial_state: BaseState, max_steps: int | None = None) -> BaseState:
+        trace_id = initial_state.trace_id
+        logger.info("Starting graph execution: %s", trace_id)
+        state = initial_state
+        execution_order = self._topological_sort()
+        if max_steps is None:
+            max_steps = float("inf")
+        with _maybe_langsmith_trace(
+            self.name,
+            run_type="chain",
+            inputs={
+                "initial_state": _summarize_state(initial_state),
+                "max_steps": max_steps,
+            },
+            metadata={"graph": self.name, "trace_id": trace_id},
+        ) as graph_run:
+            step, execution_idx = 0, 0
+            while step < max_steps and execution_idx < len(execution_order):
+                running_node_name = execution_order[execution_idx]
+                state.current_node = running_node_name
+                trace_event = TraceEvent(trace_id=trace_id, node_name=running_node_name, status=TaskStatus.IN_PROGRESS)
+                trace_event.started_at = datetime.now()
+                running_node = self.nodes[running_node_name]
+                state_before_node = state.model_copy(deep=True)
+                node_inputs = {"state": _summarize_state(state_before_node)}
+                try:
+                    with _maybe_langsmith_trace(
+                        running_node_name,
+                        run_type="tool",
+                        inputs=node_inputs,
+                        metadata={
+                            "graph": self.name,
+                            "node": running_node_name,
+                            "step": step,
+                            "trace_id": trace_id,
+                        },
+                    ) as node_run:
+                        state = await _invoke_node(running_node, state)
+                        if node_run is not None:
+                            node_run.end(outputs=_summarize_state_delta(state_before_node, state))
+                    if state.status == GraphStatus.FAILED:
+                        trace_event.status = TaskStatus.FAILED
+                        break
+                    else:
+                        trace_event.status = TaskStatus.COMPLETED
+                except Exception as e:
+                    trace_event.status = TaskStatus.FAILED
+                    trace_event.error = str(e)
+                    state.status = GraphStatus.FAILED
+                    break
+                finally:
+                    step += 1
+                    execution_idx += 1
+                    trace_event.finished_at = datetime.now()
+                    try:
+                        self.exporter.emit(trace_event)
+                    except Exception:
+                        logger.warning("exporter failed for node %s", running_node_name, exc_info=True)
+
+            if state.status == GraphStatus.FAILED:
+                pass
+            elif execution_idx == len(execution_order):
+                state.status = GraphStatus.COMPLETED
+            else:
+                state.status = GraphStatus.FAILED
+
+            if graph_run is not None:
+                graph_run.end(
+                    outputs={
+                        "final_state": _summarize_state(state),
+                        "status": state.status,
+                        "completed_steps": step,
+                    }
+                )
+            await _flush_langsmith()
+        return state
+        
+    
+    def _topological_sort(self) -> list[str]:
+        # calculate in-degrees for each node
+        node_to_in_degrees = {}
+        for to_nodes in self.edges.values():
+            for to_node in to_nodes:
+                node_to_in_degrees.setdefault(to_node, 0)
+                node_to_in_degrees[to_node] += 1
+
+        # queue of nodes with no incoming edges
+        # queue = [node for node in self.nodes if node_to_in_degrees.get(node, 0) == 0]
+        queue = deque(node for node in self.nodes if node_to_in_degrees.get(node, 0) == 0)
+        if len(queue) == 0:
+            raise ValueError("Graph has a cycle or no entry point.")
+        if len(queue) > 1:
+            if not self.entry_point:
+                raise ValueError("Graph has multiple entry points. Please set a single entry point using set_entry_point().")
+            else:
+                if self.entry_point not in queue:
+                    raise ValueError(f"Specified entry point {self.entry_point} is not a valid starting node.")
+                # reorder queue to start with the specified entry point
+                queue.remove(self.entry_point)
+                queue.appendleft(self.entry_point)
+        output_order = []
+        while queue:
+            # node = queue.pop(0)  # O(n) operation
+            node = queue.popleft() # O(1)
+            output_order.append(node)
+            if node in self.edges:
+                for to_node in self.edges[node]:
+                    node_to_in_degrees[to_node] -= 1
+                    if node_to_in_degrees[to_node] == 0:
+                        queue.append(to_node)
+
+        if len(output_order) != len(self.nodes):
+            raise ValueError("Graph has a cycle.")
+        return output_order
+    
+
