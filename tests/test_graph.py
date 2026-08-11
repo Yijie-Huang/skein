@@ -5,29 +5,27 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from pydantic import Field
+from pydantic import Field, ValidationError
 
-from skein import BaseState, Graph, InMemoryExporter, Node, NoOpExporter
-from skein.core.state import GraphStatus
+from skein import BaseState, Graph, InMemoryExporter, Node, NoOpExporter, StateDelta
+from skein.core.state import GraphStatus, SkeinStateError
 from skein.core.trace import TaskStatus
-
-
-class RecordingNode(Node):
-    """Node that appends its own name to a shared list on the state."""
-
-    async def run(self, state: TrackedState) -> TrackedState:
-        state.visited.append(self.name)
-        return state
 
 
 class TrackedState(BaseState):
     visited: list[str] = Field(default_factory=list)
 
 
+class RecordingNode(Node[TrackedState]):
+    """Node that records its own name by returning a delta, never mutating state."""
+
+    async def run(self, state: TrackedState) -> StateDelta:
+        return {"visited": [*state.visited, self.name]}
+
+
 def make_fn(name: str):
-    async def node_fn(state: TrackedState) -> TrackedState:
-        state.visited.append(name)
-        return state
+    async def node_fn(state: TrackedState) -> StateDelta:
+        return {"visited": [*state.visited, name]}
 
     return node_fn
 
@@ -80,7 +78,7 @@ def test_builder_methods_support_chaining():
 
 
 def test_failing_node_stops_execution_and_marks_graph_failed():
-    async def boom(state: TrackedState) -> TrackedState:
+    async def boom(state: TrackedState) -> StateDelta:
         raise RuntimeError("node exploded")
 
     exporter = InMemoryExporter()
@@ -152,3 +150,133 @@ def test_duplicate_node_name_is_rejected():
 
     with pytest.raises(ValueError):
         graph.add_node("a", make_fn("a2"))
+
+
+# --- delta contract ---------------------------------------------------------
+
+
+def single_node_graph(node) -> Graph:
+    graph = Graph("delta", InMemoryExporter())
+    graph.add_node("only", node)
+    graph.set_entry_point("only")
+    return graph
+
+
+def test_returning_none_leaves_state_unchanged():
+    async def touches_nothing(state: TrackedState) -> None:
+        return None
+
+    result = run_graph(single_node_graph(touches_nothing), TrackedState(trace_id="t-none"))
+
+    assert result.visited == []
+    assert result.status == GraphStatus.COMPLETED
+
+
+def test_delta_only_replaces_the_fields_it_names():
+    async def writes_one_field(state: TrackedState) -> StateDelta:
+        return {"visited": ["only-this"]}
+
+    state = TrackedState(trace_id="t-partial", visited=["pre-existing"])
+    result = run_graph(single_node_graph(writes_one_field), state)
+
+    assert result.visited == ["only-this"]
+    assert result.trace_id == "t-partial"          # untouched fields survive
+    assert result.created_at == state.created_at
+
+
+def test_unknown_field_in_delta_is_rejected():
+    async def writes_garbage(state: TrackedState) -> StateDelta:
+        return {"nope": 1, "also_nope": 2}
+
+    exporter = InMemoryExporter()
+    graph = Graph("bad-delta", exporter)
+    graph.add_node("only", writes_garbage)
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-unknown"))
+
+    assert result.status == GraphStatus.FAILED
+    error = exporter.events[-1].error
+    assert "unknown field(s)" in error
+    assert "'also_nope', 'nope'" in error
+
+
+def test_returning_a_state_object_gives_a_clear_error():
+    """The most likely migration mistake: returning state instead of a delta."""
+
+    async def returns_state(state: TrackedState) -> TrackedState:
+        return state
+
+    exporter = InMemoryExporter()
+    graph = Graph("legacy-node", exporter)
+    graph.add_node("only", returns_state)
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-legacy"))
+
+    assert result.status == GraphStatus.FAILED
+    assert "must return a dict of changed fields" in exporter.events[-1].error
+
+
+def test_delta_values_are_validated():
+    async def writes_wrong_type(state: TrackedState) -> StateDelta:
+        return {"visited": "not-a-list"}
+
+    result = run_graph(single_node_graph(writes_wrong_type), TrackedState(trace_id="t-type"))
+    assert result.status == GraphStatus.FAILED
+
+
+def test_node_can_mark_the_run_failed_through_the_delta():
+    exporter = InMemoryExporter()
+    graph = Graph("self-fail", exporter)
+
+    async def gives_up(state: TrackedState) -> StateDelta:
+        return {"status": GraphStatus.FAILED}
+
+    graph.add_node("first", gives_up)
+    graph.add_node("second", make_fn("second"))
+    graph.add_edge("first", "second")
+    graph.set_entry_point("first")
+
+    result = run_graph(graph, TrackedState(trace_id="t-selffail"))
+
+    assert result.status == GraphStatus.FAILED
+    assert result.visited == []                                   # second never ran
+    assert exporter.events[-1].status == TaskStatus.FAILED
+
+
+def test_the_caller_state_object_is_never_mutated():
+    graph = Graph("immutable", InMemoryExporter())
+    graph.add_node("a", make_fn("a"))
+    graph.add_node("b", make_fn("b"))
+    graph.add_edge("a", "b")
+    graph.set_entry_point("a")
+
+    state = TrackedState(trace_id="t-immutable")
+    result = run_graph(graph, state)
+
+    assert result.visited == ["a", "b"]
+    assert state.visited == []
+    assert state.current_node is None
+    assert state.status == GraphStatus.RUNNING
+    assert result is not state
+
+
+def test_state_is_frozen():
+    """Mutating state in place is a contract violation, so it must not be possible."""
+    state = TrackedState(trace_id="t-frozen")
+
+    with pytest.raises(ValidationError):
+        state.current_node = "sneaky"
+    with pytest.raises(ValidationError):
+        state.visited = ["sneaky"]
+
+
+def test_invalid_delta_raises_skein_state_error_directly():
+    from skein.core.graph import _invoke_node
+
+    async def writes_garbage(state: TrackedState) -> StateDelta:
+        return {"nope": 1}
+
+    with pytest.raises(SkeinStateError, match="unknown field"):
+        asyncio.run(_invoke_node("only", writes_garbage, TrackedState(trace_id="t-direct")))

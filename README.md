@@ -45,34 +45,34 @@ pip install -e ".[dev]"         # + pytest, ruff, mypy
 
 ```python
 import asyncio
-from skein import BaseState, Graph, JSONLExporter, Node
+from pydantic import Field
+from skein import BaseState, Graph, JSONLExporter, Node, StateDelta
 
 
 class ReviewState(BaseState):
     diff: str
-    findings: list[str] = []
+    findings: list[str] = Field(default_factory=list)
     verdict: str | None = None
 
 
-# A node can be a plain async function...
-async def lint(state: ReviewState) -> ReviewState:
+# A node reads the whole state and returns only the fields it changed.
+async def lint(state: ReviewState) -> StateDelta | None:
     if "TODO" in state.diff:
-        state.findings.append("leftover TODO")
-    return state
+        return {"findings": [*state.findings, "leftover TODO"]}
+    return None
 
 
-# ...or a class, when it needs configuration or dependencies.
-class DecideNode(Node):
+# A node can also be a class, when it needs configuration or dependencies.
+class DecideNode(Node[ReviewState]):
     def __init__(self) -> None:
         super().__init__("decide")
 
-    async def run(self, state: ReviewState) -> ReviewState:
-        state.verdict = "request-changes" if state.findings else "approve"
-        return state
+    async def run(self, state: ReviewState) -> StateDelta:
+        return {"verdict": "request-changes" if state.findings else "approve"}
 
 
 graph = (
-    Graph("review", JSONLExporter("traces/review.jsonl"))
+    Graph[ReviewState]("review", JSONLExporter("traces/review.jsonl"))
     .add_node("lint", lint)
     .add_node("decide", DecideNode())
     .add_edge("lint", "decide")
@@ -94,14 +94,24 @@ Every run leaves a trace behind:
 
 | | What it is |
 |---|---|
-| `BaseState` | The Pydantic model threaded through the graph. Subclass it to declare your domain fields; `trace_id`, `created_at`, `current_node`, and `status` come for free. |
-| `Node` | One unit of work: `async run(state) -> state`. Either subclass `Node` or pass a bare async function (`NodeFunction`) — the graph accepts both. |
+| `BaseState` | The frozen Pydantic model threaded through the graph. Subclass it to declare your domain fields; `trace_id`, `created_at`, `current_node`, and `status` come for free. |
+| `Node` | One unit of work: `async run(state) -> StateDelta \| None`. It reads the whole state and returns only the fields it changed (or `None` for "nothing changed"). Either subclass `Node[YourState]` or pass a bare async function (`NodeFunction`) — the graph accepts both. |
 | `Graph` | Registers nodes and edges, resolves execution order, runs the workflow, and emits a trace event per node. |
 | `TraceEvent` | The typed record of a single node execution: status, start/finish time, token usage, error. |
 | `Exporter` | Where trace events go. `NoOpExporter` (default), `InMemoryExporter`, and `JSONLExporter` ship in the box; implement `emit()` for anything else. |
 
 ### Execution semantics
 
+- **Nodes return deltas, not state.** A node reads the whole state and returns a `dict` of the
+  fields it changed — or `None` to change nothing. The graph merges the delta and re-validates the
+  result, so every step produces a new state. `BaseState` is **frozen**: assigning to a field
+  raises, which keeps "what changed" and "what the trace recorded" from drifting apart. (Freezing
+  blocks rebinding a field, not mutating a list in place — build a new value instead.)
+  Writing a field the state does not declare raises `SkeinStateError` instead of silently vanishing.
+- Because a delta *replaces* the fields it names, appending means building the new value from the
+  old one: `return {"findings": [*state.findings, "..."]}` rather than `state.findings.append(...)`.
+- `current_node` and `status` are owned by the graph, but a node can still end a run early by
+  returning `{"status": GraphStatus.FAILED}`.
 - Nodes run in **topological order**, derived from the edges. If several nodes have no incoming
   edge, you must disambiguate with `set_entry_point()`; cycles are rejected up front.
 - Execution is **sequential** — v0 runs a linear pass over the sorted order. Branching, parallel
@@ -110,6 +120,10 @@ Every run leaves a trace behind:
 - A node that raises **fails fast**: the run stops, `state.status` becomes `failed`, and the error
   is captured on that node's `TraceEvent`.
 - `max_steps` caps how many nodes may execute, so a runaway workflow stops on your terms.
+- `Node` and `Graph` are **generic in the state type**. `Graph[ReviewState].run()` returns a
+  `ReviewState`, not a `BaseState`, and `class DecideNode(Node[ReviewState])` may narrow `run`'s
+  argument without violating the base signature. The type parameter is optional — omit it and you
+  get the same runtime behaviour with looser types.
 - Trace events are emitted in a `finally` block — **success or failure, every executed node is
   recorded**. An exporter that itself throws is logged and swallowed, never masking the real error.
 
@@ -161,8 +175,17 @@ python -m skein.examples.alarm_investigation.graph                              
 pip install -e ".[mcp]" && python -m skein.examples.alarm_investigation.mcp_server   # serve the tool
 ```
 
-Requires `ANTHROPIC_API_KEY` for the investigation node. Without the `mcp` extra, the tool call
-falls back to the same synthetic metric lookup in-process, so the demo still runs.
+The investigation node needs `ANTHROPIC_API_KEY`. Without it the run stops at that node and the
+trace says why, rather than failing somewhere downstream:
+
+```
+Run failed: ANTHROPIC_API_KEY is not set. The investigation node calls Claude directly — ...
+Node: triage,        Status: TaskStatus.COMPLETED
+Node: investigation, Status: TaskStatus.FAILED
+```
+
+The `mcp` extra is optional: without it the tool call falls back to the same synthetic metric
+lookup in-process, so that half of the demo still runs.
 
 See also [`node_function_example.py`](src/skein/examples/node_function_example.py) for the smallest
 possible graph.
@@ -193,8 +216,9 @@ LangGraph optimizes for breadth of control flow. Skein optimizes for a kernel sm
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # graph execution + exporter tests
+pytest                    # kernel, exporters, and the example's no-API-call paths
 ruff check src tests
+mypy src/skein
 ```
 
 ## License

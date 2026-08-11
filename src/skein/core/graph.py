@@ -9,15 +9,15 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Generic
 
 from ..exporters.base import Exporter, NoOpExporter
 from ..logging_config import get_logger
-from .node import Node, NodeFunction
-from .state import BaseState, GraphStatus
+from .node import Node, NodeFunction, StateDelta
+from .state import BaseState, GraphStatus, S, SkeinStateError
 from .trace import TaskStatus, TraceEvent, langsmith_tracing_enabled
 
-logger = get_logger(__name__) 
+logger = get_logger(__name__)
 
 _STATE_SYSTEM_FIELDS = {"trace_id", "created_at", "current_node", "status"}
 
@@ -69,11 +69,31 @@ def _summarize_state_delta(before: BaseState, after: BaseState) -> dict[str, Any
     return delta
 
 
-async def _invoke_node(node: Node | NodeFunction, state: BaseState) -> BaseState:
+async def _invoke_node(
+    name: str, node: Node[S] | NodeFunction[S], state: S
+) -> StateDelta:
     """Run either a Node instance or a bare async NodeFunction."""
-    if isinstance(node, Node):
-        return await node.run(state)
-    return await node(state)
+    delta = await (node.run(state) if isinstance(node, Node) else node(state))
+    if delta is None:
+        return {}
+    if not isinstance(delta, dict):
+        raise SkeinStateError(
+            f"node '{name}' must return a dict of changed fields or None, "
+            f"got {type(delta).__name__}"
+        )
+    unknown = delta.keys() - type(state).model_fields.keys()
+    if unknown:
+        raise SkeinStateError(
+            f"node '{name}' wrote unknown field(s): {sorted(unknown)}"
+        )
+    return delta
+
+
+def _apply(state: S, delta: StateDelta) -> S:
+    """Return a new state with the delta merged in, re-validating the result."""
+    if not delta:
+        return state
+    return type(state).model_validate({**state.model_dump(), **delta})
 
 
 def _load_langsmith_trace() -> Any:
@@ -175,17 +195,17 @@ async def _flush_langsmith() -> None:
         logger.warning("Failed to flush LangSmith traces", exc_info=True)
 
 
-class Graph:
+class Graph(Generic[S]):
     """Directed acyclic graph for composing nodes into workflows."""
 
     def __init__(self, name: str, exporter: Exporter | None = None):
         self.name = name
-        self.nodes: dict[str, Node | NodeFunction] = {}
+        self.nodes: dict[str, Node[S] | NodeFunction[S]] = {}
         self.edges: dict[str, list[str]] = {}
         self.entry_point: str | None = None
         self.exporter: Exporter = exporter or NoOpExporter()
 
-    def add_node(self, name: str, node: Node | NodeFunction) -> Graph:
+    def add_node(self, name: str, node: Node[S] | NodeFunction[S]) -> Graph[S]:
         """Add a node to the graph — either a Node instance or an async NodeFunction."""
         if name in self.nodes:
             raise ValueError(f"Node {name} already exists in the graph.")
@@ -195,38 +215,37 @@ class Graph:
         self.edges[name] = []
         return self
 
-    def add_edge(self, from_node: str, to_node: str) -> Graph:
+    def add_edge(self, from_node: str, to_node: str) -> Graph[S]:
         if from_node not in self.nodes or to_node not in self.nodes:
             raise ValueError("Both nodes must be added to the graph before connecting.")
         self.edges[from_node].append(to_node)
         return self
     
-    def set_entry_point(self, name: str) -> Graph:
+    def set_entry_point(self, name: str) -> Graph[S]:
         if name not in self.nodes:
             raise ValueError(f"Node {name} not in graph.")
         self.entry_point = name
         return self
     
-    async def run(self, initial_state: BaseState, max_steps: int | None = None) -> BaseState:
+    async def run(self, initial_state: S, max_steps: int | None = None) -> S:
         trace_id = initial_state.trace_id
         logger.info("Starting graph execution: %s", trace_id)
         state = initial_state
         execution_order = self._topological_sort()
-        if max_steps is None:
-            max_steps = float("inf")
+        step_limit: float = float("inf") if max_steps is None else max_steps
         with _maybe_langsmith_trace(
             self.name,
             run_type="chain",
             inputs={
                 "initial_state": _summarize_state(initial_state),
-                "max_steps": max_steps,
+                "max_steps": step_limit,
             },
             metadata={"graph": self.name, "trace_id": trace_id},
         ) as graph_run:
             step, execution_idx = 0, 0
-            while step < max_steps and execution_idx < len(execution_order):
+            while step < step_limit and execution_idx < len(execution_order):
                 running_node_name = execution_order[execution_idx]
-                state.current_node = running_node_name
+                state = _apply(state, {"current_node": running_node_name})
                 trace_event = TraceEvent(
                     trace_id=trace_id,
                     node_name=running_node_name,
@@ -234,7 +253,8 @@ class Graph:
                 )
                 trace_event.started_at = datetime.now(timezone.utc)
                 running_node = self.nodes[running_node_name]
-                state_before_node = state.model_copy(deep=True)
+                # _apply never mutates, so the pre-node state stays intact without a copy.
+                state_before_node = state
                 node_inputs = {"state": _summarize_state(state_before_node)}
                 try:
                     with _maybe_langsmith_trace(
@@ -248,7 +268,8 @@ class Graph:
                             "trace_id": trace_id,
                         },
                     ) as node_run:
-                        state = await _invoke_node(running_node, state)
+                        delta = await _invoke_node(running_node_name, running_node, state)
+                        state = _apply(state, delta)
                         if node_run is not None:
                             node_run.end(outputs=_summarize_state_delta(state_before_node, state))
                     if state.status == GraphStatus.FAILED:
@@ -259,7 +280,7 @@ class Graph:
                 except Exception as e:
                     trace_event.status = TaskStatus.FAILED
                     trace_event.error = str(e)
-                    state.status = GraphStatus.FAILED
+                    state = _apply(state, {"status": GraphStatus.FAILED})
                     break
                 finally:
                     step += 1
@@ -275,9 +296,9 @@ class Graph:
             if state.status == GraphStatus.FAILED:
                 pass
             elif execution_idx == len(execution_order):
-                state.status = GraphStatus.COMPLETED
+                state = _apply(state, {"status": GraphStatus.COMPLETED})
             else:
-                state.status = GraphStatus.FAILED
+                state = _apply(state, {"status": GraphStatus.FAILED})
 
             if graph_run is not None:
                 graph_run.end(
@@ -293,7 +314,7 @@ class Graph:
     
     def _topological_sort(self) -> list[str]:
         # calculate in-degrees for each node
-        node_to_in_degrees = {}
+        node_to_in_degrees: dict[str, int] = {}
         for to_nodes in self.edges.values():
             for to_node in to_nodes:
                 node_to_in_degrees.setdefault(to_node, 0)

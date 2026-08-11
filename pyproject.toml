@@ -45,6 +45,14 @@ packages = ["src/skein"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.mypy]
+python_version = "3.10"
+
+[[tool.mypy.overrides]]
+# Optional extra — not installed in the default dev environment.
+module = ["mcp.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -59,11 +67,4 @@ select = [
     "UP",   # pyupgrade
     "DTZ",  # timezone-aware datetimes (trace timestamps must be comparable)
     "RUF",  # ruff-specific
-]
-ignore = [
-    # Comments are written in Chinese in places; full-width punctuation is
-    # intended there, not a homoglyph slip.
-    "RUF001",
-    "RUF002",
-    "RUF003",
 ]

@@ -25,9 +25,11 @@ class AlarmPayload(BaseModel):
 AlarmType = Literal["latency", "traffic", "error_rate", "saturation",
     "availability", "unknown"]
 
+Severity = Literal["low", "medium", "high", "critical"]
+
 class TriageResult(BaseModel):
     """Result of alarm triage."""
-    severity: Literal["low", "medium", "high", "critical"]
+    severity: Severity
     alarm_type: AlarmType
 
 
@@ -49,10 +51,12 @@ class InvestigationResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+SummaryStatus = Literal["resolved", "pending", "escalated"]
+
 class SummaryResult(BaseModel):
     """Summary of alarm investigation."""
     summary: str
-    status: Literal["resolved", "pending", "escalated"]
+    status: SummaryStatus
     reason: str | None = None
 
 

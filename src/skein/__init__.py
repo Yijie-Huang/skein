@@ -23,8 +23,9 @@ def _load_workspace_dotenv() -> None:
 # top of the file (E402 is suppressed rather than reordered).
 _load_workspace_dotenv()
 
-from .core import BaseState, Graph, Node, TraceEvent  # noqa: E402
+from .core import BaseState, Graph, Node, StateDelta, TraceEvent  # noqa: E402
 from .core.node import NodeFunction  # noqa: E402
+from .core.state import SkeinStateError  # noqa: E402
 from .exporters import Exporter, InMemoryExporter, JSONLExporter, NoOpExporter  # noqa: E402
 from .logging_config import configure_logging, get_logger  # noqa: E402
 
@@ -40,6 +41,8 @@ __all__ = [
 	"NoOpExporter",
 	"Node",
 	"NodeFunction",
+	"SkeinStateError",
+	"StateDelta",
 	"TraceEvent",
 	"configure_logging",
 	"get_logger",

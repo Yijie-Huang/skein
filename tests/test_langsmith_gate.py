@@ -50,8 +50,8 @@ def test_disabled_flag_never_builds_a_langsmith_client(tracing_env):
     )
     tracing_env.setattr(graph_module, "_LANGSMITH_CLIENT", graph_module._UNSET)
 
-    async def noop(state: BaseState) -> BaseState:
-        return state
+    async def noop(state: BaseState) -> None:
+        return None
 
     graph = Graph("gated")
     graph.add_node("only", noop)

@@ -11,13 +11,32 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from skein.core.node import Node
+from skein.core.node import Node, StateDelta
 from skein.core.trace import langsmith_tracing_enabled
 
 from .mcp_server import lookup_service_cpu
-from .state import AlarmInvestigationState, InvestigationResult, SummaryResult, TriageResult
+from .state import (
+    AlarmInvestigationState,
+    AlarmType,
+    InvestigationResult,
+    Severity,
+    SummaryResult,
+    SummaryStatus,
+    TriageResult,
+)
 
 _DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+
+_MAX_REACT_ROUNDS = 4
+
+
+class InvestigationUnavailable(RuntimeError):
+    """The investigation step cannot run — misconfiguration, not a bad alarm."""
+
+
+class InvestigationFailed(RuntimeError):
+    """The investigation ran but produced nothing usable."""
 
 _INVESTIGATION_SYSTEM_PROMPT = """You are an alarm investigation agent using a ReAct-style workflow.
 
@@ -115,16 +134,24 @@ def _maybe_langsmith_trace(
 
 def _load_anthropic_client() -> Any:
     if not os.getenv("ANTHROPIC_API_KEY"):
-        return None
+        raise InvestigationUnavailable(
+            "ANTHROPIC_API_KEY is not set. The investigation node calls Claude directly — "
+            "export the key, or put it in a project .env, and run the demo again."
+        )
 
     try:
         anthropic_module = importlib.import_module("anthropic")
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise InvestigationUnavailable(
+            "The 'anthropic' package is required by the investigation node. "
+            "Install it with: pip install anthropic"
+        ) from exc
 
     client_cls = getattr(anthropic_module, "AsyncAnthropic", None)
     if client_cls is None:
-        return None
+        raise InvestigationUnavailable(
+            "The installed 'anthropic' package has no AsyncAnthropic client; upgrade it."
+        )
     client = client_cls()
     if not langsmith_tracing_enabled():
         return client
@@ -156,10 +183,8 @@ def _extract_json_payload(text: str) -> str:
     return stripped
 
 
-async def _run_react_investigation(state: AlarmInvestigationState) -> InvestigationResult | None:
+async def _run_react_investigation(state: AlarmInvestigationState) -> InvestigationResult:
     client = _load_anthropic_client()
-    if client is None:
-        return None
 
     service_name = state.alarm.services[0] if state.alarm.services else "unknown-service"
     triage = state.triage
@@ -207,7 +232,7 @@ async def _run_react_investigation(state: AlarmInvestigationState) -> Investigat
         },
         metadata={"node": "investigation", "model": model},
     ) as react_run:
-        for iteration in range(4):
+        for iteration in range(_MAX_REACT_ROUNDS):
             response = await client.messages.create(
                 model=model,
                 max_tokens=700,
@@ -252,7 +277,10 @@ async def _run_react_investigation(state: AlarmInvestigationState) -> Investigat
             if not final_text:
                 if react_run is not None:
                     react_run.end(outputs={"result": None, "iteration": iteration + 1})
-                return None
+                raise InvestigationFailed(
+                    f"the model returned no text on round {iteration + 1}, "
+                    "so there is nothing to parse into an InvestigationResult"
+                )
             try:
                 with _maybe_langsmith_trace(
                     "parse_investigation_result",
@@ -273,12 +301,17 @@ async def _run_react_investigation(state: AlarmInvestigationState) -> Investigat
                         }
                     )
                 return result
-            except Exception:
+            except Exception as exc:
                 if react_run is not None:
                     react_run.end(outputs={"result": None, "iteration": iteration + 1})
-                return None
+                raise InvestigationFailed(
+                    "the model's final answer did not match the InvestigationResult schema: "
+                    f"{final_text[:200]}"
+                ) from exc
 
-    return None
+    raise InvestigationFailed(
+        f"the investigation did not reach a conclusion within {_MAX_REACT_ROUNDS} tool-use rounds"
+    )
 
 
 async def _collect_cpu_evidence(service_name: str) -> tuple[dict[str, object], str]:
@@ -336,60 +369,65 @@ async def _collect_cpu_evidence(service_name: str) -> tuple[dict[str, object], s
         return payload, "alarm_investigation_mcp.get_service_cpu"
 
 
-class TriageNode(Node):
+class TriageNode(Node[AlarmInvestigationState]):
     """Triage node for alarm investigation workflow."""
 
     def __init__(self):
         super().__init__("triage")
     
-    async def run(self, state: AlarmInvestigationState) -> AlarmInvestigationState:
+    async def run(self, state: AlarmInvestigationState) -> StateDelta:
         alarm = state.alarm
         print(f"[TriageNode] Triage alarm {alarm.alarm_id}")
-        severity = "low"
+        severity: Severity
         if alarm.threshold > 0.9:
             severity = "critical" if alarm.value > 0.95 else "high"
         else:
             severity = "medium" if alarm.value > 0.6 else "low"
-        alarm_type = "unknown"
-        if "latency" in alarm.rule_name:
-            alarm_type = "latency"
-        state.triage = TriageResult(severity=severity, alarm_type=alarm_type)
-        return state
+        alarm_type: AlarmType = "latency" if "latency" in alarm.rule_name else "unknown"
+        return {"triage": TriageResult(severity=severity, alarm_type=alarm_type)}
     
-class InvestigationNode(Node):
+class InvestigationNode(Node[AlarmInvestigationState]):
     """Investigation node for alarm investigation workflow."""
 
     def __init__(self):
         super().__init__("investigation")
     
-    async def run(self, state: AlarmInvestigationState) -> AlarmInvestigationState:
+    async def run(self, state: AlarmInvestigationState) -> StateDelta:
         triage = state.triage
+        if triage is None:
+            raise InvestigationUnavailable(
+                "investigation ran before triage produced a result — check the graph edges"
+            )
         print(
             f"[InvestigationNode] Investigating alarm {state.alarm.alarm_id} "
             f"with severity {triage.severity}"
         )
-        state.investigation = await _run_react_investigation(state)
-        return state
+        return {"investigation": await _run_react_investigation(state)}
 
 
-class SummaryNode(Node):
+class SummaryNode(Node[AlarmInvestigationState]):
     """Summary node for alarm investigation workflow."""
 
     def __init__(self):
         super().__init__("summary")
     
-    async def run(self, state: AlarmInvestigationState) -> AlarmInvestigationState:
+    async def run(self, state: AlarmInvestigationState) -> StateDelta:
         investigation = state.investigation
+        if investigation is None:
+            raise InvestigationUnavailable(
+                "summary ran before investigation produced a result — check the graph edges"
+            )
         print(f"[SummaryNode] Summarizing investigation for alarm {state.alarm.alarm_id}")
-        status = "pending"
-        reason = None
+        status: SummaryStatus
         if investigation.confidence > 0.8:
             status = "resolved"
             reason = f"Root cause identified as {investigation.root_cause}"
         else:
+            status = "pending"
             reason = "Insufficient evidence to determine root cause"
-        state.summary = SummaryResult(
-            summary="Alarm investigation completed", status=status, reason=reason
-        )
-        return state
+        return {
+            "summary": SummaryResult(
+                summary="Alarm investigation completed", status=status, reason=reason
+            )
+        }
 
