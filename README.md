@@ -138,8 +138,8 @@ for assertions in tests. Both are trivial to replace — `Exporter` has a single
 
 Install the extra (`pip install -e ".[langsmith]"`), set `LANGSMITH_TRACING=true` and
 `LANGSMITH_API_KEY`, plus optionally `LANGSMITH_PROJECT`. Each `Graph.run()` becomes a root `chain`
-run and each node a child `tool` run, carrying a summary of the state and the fields that changed —
-not the full state blob.
+run and each node a child `tool` run, taking a summary of the state as its input and reporting the
+node's delta as its output — what changed, not the whole state on every step.
 
 Export is **opt-in**: installing the dependency is not enough, the flag has to be set too. With it
 off — or with `langsmith` absent altogether — no client is built and nothing leaves the process;

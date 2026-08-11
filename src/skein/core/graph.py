@@ -53,22 +53,6 @@ def _summarize_state(state: BaseState) -> dict[str, Any]:
     return summary
 
 
-def _summarize_state_delta(before: BaseState, after: BaseState) -> dict[str, Any]:
-    before_summary = _summarize_state(before)
-    after_summary = _summarize_state(after)
-    changed_fields = sorted(
-        key
-        for key in set(before_summary) | set(after_summary)
-        if before_summary.get(key) != after_summary.get(key)
-    )
-    delta: dict[str, Any] = {"changed_fields": changed_fields}
-    if "state" in after_summary:
-        delta["state"] = after_summary["state"]
-    delta["status"] = after_summary.get("status")
-    delta["current_node"] = after_summary.get("current_node")
-    return delta
-
-
 async def _invoke_node(
     name: str, node: Node[S] | NodeFunction[S], state: S
 ) -> StateDelta:
@@ -93,7 +77,17 @@ def _apply(state: S, delta: StateDelta) -> S:
     """Return a new state with the delta merged in, re-validating the result."""
     if not delta:
         return state
-    return type(state).model_validate({**state.model_dump(), **delta})
+    return type(state).model_validate({**dict(state), **delta})
+
+
+def _apply_system(state: S, delta: StateDelta) -> S:
+    """Apply the graph's own bookkeeping writes (``current_node``, ``status``).
+
+    These values are produced by the runtime itself rather than by a node, so they
+    skip validation — but so do any model validators, which is why this must never
+    be used for a node's delta.
+    """
+    return state.model_copy(update=delta)
 
 
 def _load_langsmith_trace() -> Any:
@@ -245,7 +239,7 @@ class Graph(Generic[S]):
             step, execution_idx = 0, 0
             while step < step_limit and execution_idx < len(execution_order):
                 running_node_name = execution_order[execution_idx]
-                state = _apply(state, {"current_node": running_node_name})
+                state = _apply_system(state, {"current_node": running_node_name})
                 trace_event = TraceEvent(
                     trace_id=trace_id,
                     node_name=running_node_name,
@@ -253,9 +247,7 @@ class Graph(Generic[S]):
                 )
                 trace_event.started_at = datetime.now(timezone.utc)
                 running_node = self.nodes[running_node_name]
-                # _apply never mutates, so the pre-node state stays intact without a copy.
-                state_before_node = state
-                node_inputs = {"state": _summarize_state(state_before_node)}
+                node_inputs = {"state": _summarize_state(state)}
                 try:
                     with _maybe_langsmith_trace(
                         running_node_name,
@@ -271,7 +263,7 @@ class Graph(Generic[S]):
                         delta = await _invoke_node(running_node_name, running_node, state)
                         state = _apply(state, delta)
                         if node_run is not None:
-                            node_run.end(outputs=_summarize_state_delta(state_before_node, state))
+                            node_run.end(outputs={"delta": _serialize_trace_payload(delta)})
                     if state.status == GraphStatus.FAILED:
                         trace_event.status = TaskStatus.FAILED
                         break
@@ -280,7 +272,7 @@ class Graph(Generic[S]):
                 except Exception as e:
                     trace_event.status = TaskStatus.FAILED
                     trace_event.error = str(e)
-                    state = _apply(state, {"status": GraphStatus.FAILED})
+                    state = _apply_system(state, {"status": GraphStatus.FAILED})
                     break
                 finally:
                     step += 1
@@ -296,9 +288,9 @@ class Graph(Generic[S]):
             if state.status == GraphStatus.FAILED:
                 pass
             elif execution_idx == len(execution_order):
-                state = _apply(state, {"status": GraphStatus.COMPLETED})
+                state = _apply_system(state, {"status": GraphStatus.COMPLETED})
             else:
-                state = _apply(state, {"status": GraphStatus.FAILED})
+                state = _apply_system(state, {"status": GraphStatus.FAILED})
 
             if graph_run is not None:
                 graph_run.end(
