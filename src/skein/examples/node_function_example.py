@@ -39,7 +39,7 @@ class ValidateNode(Node[PipelineState]):
     """Validate processed data."""
 
     def __init__(self):
-        super().__init__("validate")
+        super().__init__("validate", writes=["checks"])
 
     async def run(self, state: PipelineState) -> StateDelta:
         print(f"[validate] Checking processed value: {state.processed}")

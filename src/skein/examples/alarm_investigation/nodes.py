@@ -373,7 +373,7 @@ class TriageNode(Node[AlarmInvestigationState]):
     """Triage node for alarm investigation workflow."""
 
     def __init__(self):
-        super().__init__("triage")
+        super().__init__("triage", writes=["triage"])
     
     async def run(self, state: AlarmInvestigationState) -> StateDelta:
         alarm = state.alarm
@@ -390,7 +390,7 @@ class InvestigationNode(Node[AlarmInvestigationState]):
     """Investigation node for alarm investigation workflow."""
 
     def __init__(self):
-        super().__init__("investigation")
+        super().__init__("investigation", writes=["investigation"])
     
     async def run(self, state: AlarmInvestigationState) -> StateDelta:
         triage = state.triage
@@ -409,7 +409,7 @@ class SummaryNode(Node[AlarmInvestigationState]):
     """Summary node for alarm investigation workflow."""
 
     def __init__(self):
-        super().__init__("summary")
+        super().__init__("summary", writes=["summary"])
     
     async def run(self, state: AlarmInvestigationState) -> StateDelta:
         investigation = state.investigation

@@ -62,10 +62,10 @@ async def lint(state: ReviewState) -> StateDelta | None:
     return None
 
 
-# A node can also be a class, when it needs configuration or dependencies.
+# A node can also be a class, and can declare up front which fields it writes.
 class DecideNode(Node[ReviewState]):
     def __init__(self) -> None:
-        super().__init__("decide")
+        super().__init__("decide", writes=["verdict"])
 
     async def run(self, state: ReviewState) -> StateDelta:
         return {"verdict": "request-changes" if state.findings else "approve"}
@@ -95,7 +95,7 @@ Every run leaves a trace behind:
 | | What it is |
 |---|---|
 | `BaseState` | The frozen Pydantic model threaded through the graph. Subclass it to declare your domain fields; `trace_id`, `created_at`, `current_node`, and `status` come for free. |
-| `Node` | One unit of work: `async run(state) -> StateDelta \| None`. It reads the whole state and returns only the fields it changed (or `None` for "nothing changed"). Either subclass `Node[YourState]` or pass a bare async function (`NodeFunction`) — the graph accepts both. |
+| `Node` | One unit of work: `async run(state) -> StateDelta \| None`. It reads the whole state and returns only the fields it changed (or `None` for "nothing changed"), and can declare that write set as `writes=[...]`. Either subclass `Node[YourState]` or pass a bare async function (`NodeFunction`) — the graph accepts both. |
 | `Graph` | Registers nodes and edges, resolves execution order, runs the workflow, and emits a trace event per node. |
 | `TraceEvent` | The typed record of a single node execution: status, start/finish time, token usage, error. |
 | `Exporter` | Where trace events go. `NoOpExporter` (default), `InMemoryExporter`, and `JSONLExporter` ship in the box; implement `emit()` for anything else. |
@@ -110,6 +110,15 @@ Every run leaves a trace behind:
   Writing a field the state does not declare raises `SkeinStateError` instead of silently vanishing.
 - Because a delta *replaces* the fields it names, appending means building the new value from the
   old one: `return {"findings": [*state.findings, "..."]}` rather than `state.findings.append(...)`.
+- A `Node` may declare its write set — `super().__init__("decide", writes=["verdict"])` — and the
+  graph holds it to that: returning anything outside the set raises, as does declaring a field the
+  state does not have (so a typo surfaces even if the node never writes it). `status` is exempt, so
+  any node can still end a run early. `writes` is optional; omit it and the node is unchecked. It
+  doubles as documentation: you can read which fields a workflow touches, and where, without
+  opening a single `run()`.
+- `add_node(name, node, writes=[...])` declares the same thing from the outside, for the cases the
+  constructor cannot reach: a bare async function has nowhere to hang the declaration, and a node
+  you did not write may need one supplied for it. It wins over the node's own `writes`.
 - `current_node` and `status` are owned by the graph, but a node can still end a run early by
   returning `{"status": GraphStatus.FAILED}`.
 - Nodes run in **topological order**, derived from the edges. If several nodes have no incoming

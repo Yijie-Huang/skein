@@ -262,6 +262,154 @@ def test_the_caller_state_object_is_never_mutated():
     assert result is not state
 
 
+# --- declared writes --------------------------------------------------------
+
+
+class DeclaringNode(Node[TrackedState]):
+    """Writes exactly what it declares."""
+
+    def __init__(self, name: str, writes, delta: StateDelta):
+        super().__init__(name, writes=writes)
+        self._delta = delta
+
+    async def run(self, state: TrackedState) -> StateDelta:
+        return self._delta
+
+
+def test_declared_write_is_allowed():
+    node = DeclaringNode("ok", ["visited"], {"visited": ["a"]})
+
+    result = run_graph(single_node_graph(node), TrackedState(trace_id="t-declared"))
+
+    assert result.visited == ["a"]
+    assert result.status == GraphStatus.COMPLETED
+
+
+def test_undeclared_write_is_rejected():
+    node = DeclaringNode("sneaky", ["visited"], {"visited": ["a"], "current_node": "elsewhere"})
+
+    exporter = InMemoryExporter()
+    graph = Graph("undeclared", exporter)
+    graph.add_node("only", node)
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-undeclared"))
+
+    assert result.status == GraphStatus.FAILED
+    error = exporter.events[-1].error
+    assert "undeclared field(s): ['current_node']" in error
+    assert "writes=['visited']" in error
+
+
+def test_declaring_a_field_the_state_lacks_is_rejected():
+    """Catches a typo in `writes` even when the node never writes that field."""
+    node = DeclaringNode("typo", ["visted"], {})
+
+    exporter = InMemoryExporter()
+    graph = Graph("bad-declaration", exporter)
+    graph.add_node("only", node)
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-typo"))
+
+    assert result.status == GraphStatus.FAILED
+    assert "declares writes to field(s) ['visted']" in exporter.events[-1].error
+
+
+def test_empty_writes_forbids_every_write():
+    node = DeclaringNode("read-only", [], {"visited": ["a"]})
+
+    exporter = InMemoryExporter()
+    graph = Graph("read-only", exporter)
+    graph.add_node("only", node)
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-readonly"))
+
+    assert result.status == GraphStatus.FAILED
+    assert "undeclared field(s): ['visited']" in exporter.events[-1].error
+
+
+def test_add_node_can_declare_writes_for_a_bare_function():
+    """A plain async function has nowhere to hang the declaration."""
+    exporter = InMemoryExporter()
+    graph = Graph("fn-writes", exporter)
+    graph.add_node("only", make_fn("a"), writes=["current_node"])
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-fnwrites"))
+
+    assert result.status == GraphStatus.FAILED
+    assert "undeclared field(s): ['visited']" in exporter.events[-1].error
+
+
+def test_add_node_writes_overrides_the_nodes_own_declaration():
+    """Wrapping someone else's node, the graph gets the last word."""
+    node = DeclaringNode("theirs", ["current_node"], {"visited": ["a"]})
+
+    graph = Graph("override", InMemoryExporter())
+    graph.add_node("only", node, writes=["visited"])
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-override"))
+
+    assert result.visited == ["a"]                      # allowed by the override
+    assert node.writes == frozenset({"current_node"})   # the node itself is untouched
+
+
+def test_add_node_keeps_the_nodes_declaration_when_no_override_is_given():
+    node = DeclaringNode("theirs", ["visited"], {"visited": ["a"]})
+
+    graph = Graph("inherit", InMemoryExporter())
+    graph.add_node("only", node)
+
+    assert graph.node_writes["only"] == frozenset({"visited"})
+
+
+def test_a_bare_string_is_rejected_as_a_write_set():
+    graph = Graph("stringly")
+
+    with pytest.raises(TypeError, match='did you mean \\["verdict"\\]'):
+        graph.add_node("only", make_fn("a"), writes="verdict")
+
+    with pytest.raises(TypeError, match="not the string"):
+        RecordingNode("n", writes="verdict")
+
+
+def test_status_may_be_written_without_declaring_it():
+    """Ending a run early is control flow open to every node."""
+    node = DeclaringNode("bail", ["visited"], {"status": GraphStatus.FAILED})
+
+    exporter = InMemoryExporter()
+    graph = Graph("bail", exporter)
+    graph.add_node("only", node)
+    graph.add_node("next", make_fn("next"))
+    graph.add_edge("only", "next")
+    graph.set_entry_point("only")
+
+    result = run_graph(graph, TrackedState(trace_id="t-bail"))
+
+    assert result.status == GraphStatus.FAILED
+    assert result.visited == []
+    assert exporter.events[-1].error is None      # a declared-writes violation, not an error
+
+
+def test_writes_is_optional():
+    """Nodes that do not declare writes keep working unchecked."""
+    node = DeclaringNode("undeclared", None, {"visited": ["anything"]})
+    assert node.writes is None
+
+    result = run_graph(single_node_graph(node), TrackedState(trace_id="t-optional"))
+    assert result.visited == ["anything"]
+
+
+def test_repr_shows_declared_writes():
+    assert repr(DeclaringNode("d", ["visited"], {})) == (
+        "DeclaringNode(name='d', writes=['visited'])"
+    )
+    assert repr(DeclaringNode("d", None, {})) == "DeclaringNode(name='d')"
+
+
 def test_state_is_frozen():
     """Mutating state in place is a contract violation, so it must not be possible."""
     state = TrackedState(trace_id="t-frozen")

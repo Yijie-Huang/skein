@@ -6,20 +6,24 @@ import importlib
 import inspect
 import os
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generic
 
 from ..exporters.base import Exporter, NoOpExporter
 from ..logging_config import get_logger
-from .node import Node, NodeFunction, StateDelta
+from .node import Node, NodeFunction, StateDelta, normalize_writes
 from .state import BaseState, GraphStatus, S, SkeinStateError
 from .trace import TaskStatus, TraceEvent, langsmith_tracing_enabled
 
 logger = get_logger(__name__)
 
 _STATE_SYSTEM_FIELDS = {"trace_id", "created_at", "current_node", "status"}
+
+# Writable by any node without being declared: ending a run early is control flow
+# available to every node, not something it should have to list as a write.
+_ALWAYS_WRITABLE = frozenset({"status"})
 
 
 def _serialize_trace_payload(value: Any) -> Any:
@@ -54,9 +58,21 @@ def _summarize_state(state: BaseState) -> dict[str, Any]:
 
 
 async def _invoke_node(
-    name: str, node: Node[S] | NodeFunction[S], state: S
+    name: str,
+    node: Node[S] | NodeFunction[S],
+    state: S,
+    declared: frozenset[str] | None = None,
 ) -> StateDelta:
     """Run either a Node instance or a bare async NodeFunction."""
+    fields = type(state).model_fields.keys()
+    if declared is not None:
+        missing = declared - fields
+        if missing:
+            raise SkeinStateError(
+                f"node '{name}' declares writes to field(s) {sorted(missing)}, "
+                f"which {type(state).__name__} does not have"
+            )
+
     delta = await (node.run(state) if isinstance(node, Node) else node(state))
     if delta is None:
         return {}
@@ -65,11 +81,18 @@ async def _invoke_node(
             f"node '{name}' must return a dict of changed fields or None, "
             f"got {type(delta).__name__}"
         )
-    unknown = delta.keys() - type(state).model_fields.keys()
+    unknown = delta.keys() - fields
     if unknown:
         raise SkeinStateError(
             f"node '{name}' wrote unknown field(s): {sorted(unknown)}"
         )
+    if declared is not None:
+        undeclared = delta.keys() - declared - _ALWAYS_WRITABLE
+        if undeclared:
+            raise SkeinStateError(
+                f"node '{name}' wrote undeclared field(s): {sorted(undeclared)}; "
+                f"it declares writes={sorted(declared)}"
+            )
     return delta
 
 
@@ -195,17 +218,32 @@ class Graph(Generic[S]):
     def __init__(self, name: str, exporter: Exporter | None = None):
         self.name = name
         self.nodes: dict[str, Node[S] | NodeFunction[S]] = {}
+        self.node_writes: dict[str, frozenset[str] | None] = {}
         self.edges: dict[str, list[str]] = {}
         self.entry_point: str | None = None
         self.exporter: Exporter = exporter or NoOpExporter()
 
-    def add_node(self, name: str, node: Node[S] | NodeFunction[S]) -> Graph[S]:
-        """Add a node to the graph — either a Node instance or an async NodeFunction."""
+    def add_node(
+        self,
+        name: str,
+        node: Node[S] | NodeFunction[S],
+        *,
+        writes: Iterable[str] | None = None,
+    ) -> Graph[S]:
+        """Add a node to the graph — either a Node instance or an async NodeFunction.
+
+        ``writes`` declares the fields this node may change, for the cases a `Node`
+        cannot cover: a bare async function has nowhere to hang the declaration, and
+        a node you did not write may need one supplied from outside. It takes
+        precedence over the node's own ``writes``.
+        """
         if name in self.nodes:
             raise ValueError(f"Node {name} already exists in the graph.")
         if not isinstance(node, Node) and not callable(node):
             raise TypeError(f"Node {name} must be a Node instance or an async callable.")
+        declared = normalize_writes(writes)
         self.nodes[name] = node
+        self.node_writes[name] = declared if declared is not None else getattr(node, "writes", None)
         self.edges[name] = []
         return self
 
@@ -260,7 +298,12 @@ class Graph(Generic[S]):
                             "trace_id": trace_id,
                         },
                     ) as node_run:
-                        delta = await _invoke_node(running_node_name, running_node, state)
+                        delta = await _invoke_node(
+                            running_node_name,
+                            running_node,
+                            state,
+                            self.node_writes[running_node_name],
+                        )
                         state = _apply(state, delta)
                         if node_run is not None:
                             node_run.end(outputs={"delta": _serialize_trace_payload(delta)})
