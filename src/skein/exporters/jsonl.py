@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from skein.exporters.base import Exporter
+
 from skein.core.trace import TraceEvent
+from skein.exporters.base import Exporter
 
 
 class JSONLExporter(Exporter):

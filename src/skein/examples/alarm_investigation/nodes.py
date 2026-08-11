@@ -6,14 +6,16 @@ import importlib
 import json
 import os
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from skein.core.node import Node
 from skein.core.trace import langsmith_tracing_enabled
-from .state import AlarmInvestigationState, TriageResult, InvestigationResult, SummaryResult
+
 from .mcp_server import lookup_service_cpu
+from .state import AlarmInvestigationState, InvestigationResult, SummaryResult, TriageResult
 
 _DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
@@ -179,7 +181,9 @@ async def _run_react_investigation(state: AlarmInvestigationState) -> Investigat
     tools = [
         {
             "name": "get_service_cpu",
-            "description": "Fetch the current CPU usage observation for a service impacted by the alarm.",
+            "description": (
+                "Fetch the current CPU usage observation for a service impacted by the alarm."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -214,7 +218,9 @@ async def _run_react_investigation(state: AlarmInvestigationState) -> Investigat
             assistant_content = response.content
             messages.append({"role": "assistant", "content": assistant_content})
 
-            tool_uses = [block for block in assistant_content if getattr(block, "type", None) == "tool_use"]
+            tool_uses = [
+                block for block in assistant_content if getattr(block, "type", None) == "tool_use"
+            ]
             if tool_uses:
                 tool_results: list[dict[str, Any]] = []
                 for block in tool_uses:
@@ -254,7 +260,9 @@ async def _run_react_investigation(state: AlarmInvestigationState) -> Investigat
                     inputs={"response_text": final_text},
                     metadata={"node": "investigation", "iteration": iteration + 1},
                 ) as parse_run:
-                    result = InvestigationResult.model_validate_json(_extract_json_payload(final_text))
+                    result = InvestigationResult.model_validate_json(
+                        _extract_json_payload(final_text)
+                    )
                     if parse_run is not None:
                         parse_run.end(outputs=result.model_dump(mode="json"))
                 if react_run is not None:
@@ -322,7 +330,9 @@ async def _collect_cpu_evidence(service_name: str) -> tuple[dict[str, object], s
 
         payload = json.loads("".join(text_parts))
         if tool_run is not None:
-            tool_run.end(outputs={"payload": payload, "source": "alarm_investigation_mcp.get_service_cpu"})
+            tool_run.end(
+                outputs={"payload": payload, "source": "alarm_investigation_mcp.get_service_cpu"}
+            )
         return payload, "alarm_investigation_mcp.get_service_cpu"
 
 
@@ -354,7 +364,10 @@ class InvestigationNode(Node):
     
     async def run(self, state: AlarmInvestigationState) -> AlarmInvestigationState:
         triage = state.triage
-        print(f"[InvestigationNode] Investigating alarm {state.alarm.alarm_id} with severity {triage.severity}")
+        print(
+            f"[InvestigationNode] Investigating alarm {state.alarm.alarm_id} "
+            f"with severity {triage.severity}"
+        )
         state.investigation = await _run_react_investigation(state)
         return state
 
@@ -375,6 +388,8 @@ class SummaryNode(Node):
             reason = f"Root cause identified as {investigation.root_cause}"
         else:
             reason = "Insufficient evidence to determine root cause"
-        state.summary = SummaryResult(summary="Alarm investigation completed", status=status, reason=reason)
+        state.summary = SummaryResult(
+            summary="Alarm investigation completed", status=status, reason=reason
+        )
         return state
 

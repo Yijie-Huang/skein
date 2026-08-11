@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
 from datetime import datetime
-from skein.core.state import BaseState
 from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from skein.core.state import BaseState
 
 
 class AlarmPayload(BaseModel):

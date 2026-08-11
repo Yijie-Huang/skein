@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import os
-from pydantic import BaseModel, Field
-from typing import Optional
+from datetime import datetime, timezone
 from enum import Enum
-from datetime import datetime
+
+from pydantic import BaseModel, Field
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -32,7 +32,7 @@ class TraceEvent(BaseModel):
     trace_id: str
     node_name: str
     status: TaskStatus = TaskStatus.PENDING
-    started_at: datetime = Field(default_factory=datetime.now)
-    finished_at: Optional[datetime] = None
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: datetime | None = None
     token_usage: dict[str, int] = Field(default_factory=dict)
-    error: Optional[str] = None
+    error: str | None = None

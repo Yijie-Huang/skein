@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from skein.core import Graph, BaseState, Node
+
+from skein.core import BaseState, Graph, Node
 from skein.exporters import InMemoryExporter
 
 

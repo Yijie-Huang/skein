@@ -25,7 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "ruff>=0.1.0",
+    "ruff>=0.16.2,<0.17",
     "mypy>=1.0",
 ]
 langsmith = [
@@ -48,3 +48,22 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+# Pin the rule set explicitly: ruff's implicit defaults change between releases,
+# so relying on them makes lint results depend on whichever version CI resolves.
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "DTZ",  # timezone-aware datetimes (trace timestamps must be comparable)
+    "RUF",  # ruff-specific
+]
+ignore = [
+    # Comments are written in Chinese in places; full-width punctuation is
+    # intended there, not a homoglyph slip.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]

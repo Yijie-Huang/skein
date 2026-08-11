@@ -1,6 +1,6 @@
 """Alarm investigation workflow."""
 
+from .nodes import InvestigationNode, SummaryNode, TriageNode
 from .state import AlarmInvestigationState
-from .nodes import TriageNode, InvestigationNode, SummaryNode
 
-__all__ = ["AlarmInvestigationState", "TriageNode", "InvestigationNode", "SummaryNode"]
+__all__ = ["AlarmInvestigationState", "InvestigationNode", "SummaryNode", "TriageNode"]

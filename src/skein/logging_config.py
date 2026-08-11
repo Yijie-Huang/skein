@@ -6,7 +6,7 @@ import logging
 import logging.handlers
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 _configured = False
 
@@ -49,7 +49,7 @@ def configure_logging(
     # File handler (optional)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         log_file = os.path.join(log_dir, f"skein_{timestamp}.log")
         file_handler = logging.handlers.RotatingFileHandler(
             log_file,

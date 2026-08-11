@@ -8,8 +8,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-import skein  # noqa: F401  # Ensures project .env is loaded before creating the client.
 from langsmith import Client
+
+import skein  # noqa: F401  # Ensures project .env is loaded before creating the client.
 
 
 def _build_filter(trace_id: str | None, run_type: str | None, raw_filter: str | None) -> str | None:

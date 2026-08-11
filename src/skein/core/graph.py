@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from collections import deque
-from contextlib import contextmanager
-from datetime import datetime
 import importlib
 import inspect
 import os
-from typing import Any, Iterator
+from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any
 
-from .state import BaseState, GraphStatus
-from .node import Node, NodeFunction
-from .trace import TraceEvent, TaskStatus, langsmith_tracing_enabled
 from ..exporters.base import Exporter, NoOpExporter
 from ..logging_config import get_logger
+from .node import Node, NodeFunction
+from .state import BaseState, GraphStatus
+from .trace import TaskStatus, TraceEvent, langsmith_tracing_enabled
 
 logger = get_logger(__name__) 
 
@@ -226,8 +227,12 @@ class Graph:
             while step < max_steps and execution_idx < len(execution_order):
                 running_node_name = execution_order[execution_idx]
                 state.current_node = running_node_name
-                trace_event = TraceEvent(trace_id=trace_id, node_name=running_node_name, status=TaskStatus.IN_PROGRESS)
-                trace_event.started_at = datetime.now()
+                trace_event = TraceEvent(
+                    trace_id=trace_id,
+                    node_name=running_node_name,
+                    status=TaskStatus.IN_PROGRESS,
+                )
+                trace_event.started_at = datetime.now(timezone.utc)
                 running_node = self.nodes[running_node_name]
                 state_before_node = state.model_copy(deep=True)
                 node_inputs = {"state": _summarize_state(state_before_node)}
@@ -259,11 +264,13 @@ class Graph:
                 finally:
                     step += 1
                     execution_idx += 1
-                    trace_event.finished_at = datetime.now()
+                    trace_event.finished_at = datetime.now(timezone.utc)
                     try:
                         self.exporter.emit(trace_event)
                     except Exception:
-                        logger.warning("exporter failed for node %s", running_node_name, exc_info=True)
+                        logger.warning(
+                            "exporter failed for node %s", running_node_name, exc_info=True
+                        )
 
             if state.status == GraphStatus.FAILED:
                 pass
@@ -299,10 +306,15 @@ class Graph:
             raise ValueError("Graph has a cycle or no entry point.")
         if len(queue) > 1:
             if not self.entry_point:
-                raise ValueError("Graph has multiple entry points. Please set a single entry point using set_entry_point().")
+                raise ValueError(
+                    "Graph has multiple entry points. "
+                    "Please set a single entry point using set_entry_point()."
+                )
             else:
                 if self.entry_point not in queue:
-                    raise ValueError(f"Specified entry point {self.entry_point} is not a valid starting node.")
+                    raise ValueError(
+                        f"Specified entry point {self.entry_point} is not a valid starting node."
+                    )
                 # reorder queue to start with the specified entry point
                 queue.remove(self.entry_point)
                 queue.appendleft(self.entry_point)

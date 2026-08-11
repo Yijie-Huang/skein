@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import Field
 
 from skein import BaseState, Graph, InMemoryExporter, Node, NoOpExporter
 from skein.core.state import GraphStatus
@@ -20,7 +21,7 @@ class RecordingNode(Node):
 
 
 class TrackedState(BaseState):
-    visited: list[str] = []
+    visited: list[str] = Field(default_factory=list)
 
 
 def make_fn(name: str):

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import uuid
-from .state import AlarmInvestigationState, AlarmPayload
-from .nodes import TriageNode, InvestigationNode, SummaryNode
+from datetime import datetime, timezone
+
 from skein.core.graph import Graph
 from skein.exporters.memory import InMemoryExporter
+
+from .nodes import InvestigationNode, SummaryNode, TriageNode
+from .state import AlarmInvestigationState, AlarmPayload
+
 
 class AlarmInvestigationGraph(Graph):
 
@@ -25,7 +29,10 @@ class AlarmInvestigationGraph(Graph):
         if isinstance(exporter, InMemoryExporter):
             print("Execution trace:")
             for event in exporter.events:
-                print(f"Node: {event.node_name}, Status: {event.status}, Started at: {event.started_at}, Finished at: {event.finished_at}")
+                print(
+                    f"Node: {event.node_name}, Status: {event.status}, "
+                    f"Started at: {event.started_at}, Finished at: {event.finished_at}"
+                )
     
 async def main():
     graph = AlarmInvestigationGraph()
@@ -35,7 +42,7 @@ async def main():
         metric_name="p95_latency",
         value=0.92,
         threshold=0.9,
-        started_at=__import__("datetime").datetime.now(),
+        started_at=datetime.now(timezone.utc),
         services=["service-a", "service-b"],
     )
     await graph.investage_alarm(alarm)
