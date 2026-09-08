@@ -24,6 +24,7 @@ def _load_workspace_dotenv() -> None:
 _load_workspace_dotenv()
 
 from .core import BaseState, Graph, Node, StateDelta, TraceEvent  # noqa: E402
+from .core.graph import SkeinGraphError  # noqa: E402
 from .core.node import NodeFunction  # noqa: E402
 from .core.state import SkeinStateError  # noqa: E402
 from .exporters import Exporter, InMemoryExporter, JSONLExporter, NoOpExporter  # noqa: E402
@@ -41,6 +42,7 @@ __all__ = [
 	"NoOpExporter",
 	"Node",
 	"NodeFunction",
+	"SkeinGraphError",
 	"SkeinStateError",
 	"StateDelta",
 	"TraceEvent",

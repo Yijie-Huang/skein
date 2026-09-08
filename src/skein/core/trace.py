@@ -28,9 +28,17 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 class TraceEvent(BaseModel):
-    """Complete record of an agent run — used for eval and debugging."""
+    """Complete record of an agent run — used for eval and debugging.
+
+    ``wave`` is dependency depth; ``group`` is the batch within it that actually
+    ran together. Nodes sharing both ran concurrently; nodes in the same wave but
+    different groups were split apart, so the scheduling is never left to be
+    inferred from timestamps.
+    """
     trace_id: str
     node_name: str
+    wave: int | None = None
+    group: int | None = None
     status: TaskStatus = TaskStatus.PENDING
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None

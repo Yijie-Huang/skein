@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from pydantic import Field, ValidationError
 
 from skein import BaseState, Graph, InMemoryExporter, Node, NoOpExporter, StateDelta
+from skein.core.graph import SkeinGraphError
 from skein.core.state import GraphStatus, SkeinStateError
 from skein.core.trace import TaskStatus
 
 
 class TrackedState(BaseState):
     visited: list[str] = Field(default_factory=list)
+    marker: str | None = None
 
 
 class RecordingNode(Node[TrackedState]):
@@ -123,17 +126,124 @@ def test_cycle_is_rejected():
         run_graph(graph, TrackedState(trace_id="t-cycle"))
 
 
-def test_multiple_entry_points_require_explicit_entry_point():
+async def set_marker(state: TrackedState) -> StateDelta:
+    return {"marker": "set"}
+
+
+def test_multiple_roots_share_the_first_wave():
+    """Nothing to disambiguate: independent roots simply run in the same wave."""
     graph = Graph("forked")
+    graph.add_node("a", make_fn("a"), writes=["visited"])
+    graph.add_node("b", set_marker, writes=["marker"])
+
+    assert graph.waves == [["a", "b"]]
+
+    result = run_graph(graph, TrackedState(trace_id="t-forked"))
+
+    assert result.visited == ["a"]
+    assert result.marker == "set"
+    assert result.status == GraphStatus.COMPLETED
+
+
+def test_undeclared_nodes_are_split_into_their_own_groups(caplog):
+    """A node that declares nothing cannot be cleared of a conflict, so it runs alone.
+
+    Run together, both nodes would read the same snapshot and rewrite `visited`,
+    and merging would keep only the last. Split apart, the second sees the first's
+    result and the writes chain.
+    """
+    exporter = InMemoryExporter()
+    graph = Graph("undeclared", exporter)
     graph.add_node("a", make_fn("a"))
     graph.add_node("b", make_fn("b"))
 
-    with pytest.raises(ValueError, match="multiple entry points"):
-        run_graph(graph, TrackedState(trace_id="t-forked"))
+    with caplog.at_level(logging.WARNING):
+        result = run_graph(graph, TrackedState(trace_id="t-undeclared"))
 
+    assert result.visited == ["a", "b"]
+    assert "is split into 2 groups" in caplog.text
+    # Same wave, different groups — visibly split apart rather than run together.
+    assert [(e.node_name, e.wave, e.group) for e in exporter.events] == [
+        ("a", 0, 0),
+        ("b", 0, 1),
+    ]
+
+
+def test_the_trace_records_which_wave_and_group_a_node_ran_in():
+    """Whether nodes really ran together is recorded, not left to be inferred."""
+    exporter = InMemoryExporter()
+    graph = Graph("observable", exporter)
+    graph.add_node("root", make_fn("root"), writes=["visited"])
+    graph.add_node("mark", set_marker, writes=["marker"])
+    graph.add_node("tail", set_marker, writes=["marker"])
+    graph.add_edge("root", "tail")
+    graph.add_edge("mark", "tail")
+
+    run_graph(graph, TrackedState(trace_id="t-observable"))
+
+    recorded = [(e.node_name, e.wave, e.group) for e in exporter.events]
+    assert recorded == [
+        ("root", 0, 0),
+        ("mark", 0, 0),   # same wave and group -> really ran together
+        ("tail", 1, 0),
+    ]
+
+
+def test_a_split_wave_keeps_the_groups_that_already_succeeded():
+    """All-or-nothing is per group, the unit that actually runs together.
+
+    Splitting orders these nodes, so an earlier group's result surviving a later
+    failure is the same behaviour a linear graph has always had.
+    """
+
+    async def boom(state: TrackedState) -> StateDelta:
+        raise RuntimeError("second exploded")
+
+    async def never_runs(state: TrackedState) -> StateDelta:
+        raise AssertionError("the run should have stopped before this")
+
+    exporter = InMemoryExporter()
+    graph = Graph("split-atomic", exporter)
+    graph.add_node("first", make_fn("first"))     # undeclared → each runs alone
+    graph.add_node("second", boom)
+    graph.add_node("third", never_runs)
+
+    result = run_graph(graph, TrackedState(trace_id="t-split-atomic"))
+
+    assert result.status == GraphStatus.FAILED
+    assert result.visited == ["first"]            # its group completed before the failure
+    assert [e.node_name for e in exporter.events] == ["first", "second"]
+    assert "second exploded" in exporter.events[-1].error
+
+
+def test_a_failing_group_discards_its_own_members():
+    """Within one group it is still all or nothing."""
+
+    async def boom(state: TrackedState) -> StateDelta:
+        raise RuntimeError("sibling exploded")
+
+    exporter = InMemoryExporter()
+    graph = Graph("group-atomic", exporter)
+    graph.add_node("ok", make_fn("ok"), writes=["visited"])
+    graph.add_node("boom", boom, writes=["marker"])
+
+    result = run_graph(graph, TrackedState(trace_id="t-group-atomic"))
+
+    assert result.status == GraphStatus.FAILED
+    assert result.visited == []                   # the sibling's delta went with it
+    assert {e.wave for e in exporter.events} == {0}
+    assert {e.group for e in exporter.events} == {0}
+
+
+def test_entry_point_with_incoming_edges_is_rejected():
+    graph = Graph("bad-entry")
+    graph.add_node("a", make_fn("a"))
+    graph.add_node("b", make_fn("b"))
+    graph.add_edge("a", "b")
     graph.set_entry_point("b")
-    result = run_graph(graph, TrackedState(trace_id="t-forked-2"))
-    assert result.visited == ["b", "a"]
+
+    with pytest.raises(ValueError, match="cannot start the graph"):
+        graph.build()
 
 
 def test_edges_require_registered_nodes():
@@ -260,6 +370,197 @@ def test_the_caller_state_object_is_never_mutated():
     assert state.current_node is None
     assert state.status == GraphStatus.RUNNING
     assert result is not state
+
+
+# --- build ------------------------------------------------------------------
+
+
+def test_waves_group_nodes_by_dependency_depth():
+    graph = Graph("diamond")
+    for name in ("root", "left", "right", "join"):
+        graph.add_node(name, make_fn(name))
+    graph.add_edge("root", "left")
+    graph.add_edge("root", "right")
+    graph.add_edge("left", "join")
+    graph.add_edge("right", "join")
+
+    assert graph.build().waves == [["root"], ["left", "right"], ["join"]]
+
+
+def test_two_nodes_in_one_wave_writing_the_same_field_is_refused():
+    graph = Graph("conflict")
+    graph.add_node("left", make_fn("left"), writes=["visited"])
+    graph.add_node("right", make_fn("right"), writes=["visited"])
+
+    with pytest.raises(SkeinGraphError, match="written by both 'left' and 'right'"):
+        graph.build()
+
+
+def test_the_same_field_across_different_waves_is_fine():
+    """Sequenced writes have a defined winner, so they are not a conflict."""
+    graph = Graph("sequenced")
+    graph.add_node("first", make_fn("first"), writes=["visited"])
+    graph.add_node("second", make_fn("second"), writes=["visited"])
+    graph.add_edge("first", "second")
+
+    assert graph.build().waves == [["first"], ["second"]]
+
+
+def test_undeclared_nodes_take_part_in_no_conflict():
+    """Without a declaration there is nothing to compare, so the graph still builds."""
+    graph = Graph("opaque")
+    graph.add_node("left", make_fn("left"))
+    graph.add_node("right", make_fn("right"), writes=["visited"])
+
+    assert graph.build().waves == [["left", "right"]]
+
+
+def test_status_is_not_a_conflict():
+    graph = Graph("both-can-fail")
+    graph.add_node("left", make_fn("left"), writes=["status"])
+    graph.add_node("right", make_fn("right"), writes=["status"])
+
+    graph.build()
+
+
+def test_build_is_idempotent_and_chainable():
+    graph = Graph("repeat")
+    graph.add_node("a", make_fn("a"))
+
+    assert graph.build().build() is graph
+    assert graph.waves == [["a"]]
+
+
+def test_editing_the_graph_after_building_rebuilds_it():
+    graph = Graph("mutating")
+    graph.add_node("a", make_fn("a"))
+    assert graph.waves == [["a"]]
+
+    graph.add_node("b", make_fn("b"))
+    graph.add_edge("a", "b")
+
+    assert graph.waves == [["a"], ["b"]]
+
+
+def test_run_builds_on_demand_and_surfaces_conflicts():
+    graph = Graph("unbuilt", InMemoryExporter())
+    graph.add_node("left", make_fn("left"), writes=["visited"])
+    graph.add_node("right", make_fn("right"), writes=["visited"])
+
+    with pytest.raises(SkeinGraphError):
+        run_graph(graph, TrackedState(trace_id="t-unbuilt"))
+
+
+# --- parallel waves ---------------------------------------------------------
+
+
+def test_a_wave_really_runs_concurrently():
+    """Each node waits for the other, so this only finishes if they overlap."""
+    reached_a, reached_b = asyncio.Event(), asyncio.Event()
+
+    async def a(state: TrackedState) -> StateDelta:
+        reached_a.set()
+        await asyncio.wait_for(reached_b.wait(), timeout=2)
+        return {"visited": ["a"]}
+
+    async def b(state: TrackedState) -> StateDelta:
+        reached_b.set()
+        await asyncio.wait_for(reached_a.wait(), timeout=2)
+        return {"marker": "b"}
+
+    graph = Graph("concurrent")
+    graph.add_node("a", a, writes=["visited"])
+    graph.add_node("b", b, writes=["marker"])
+
+    result = run_graph(graph, TrackedState(trace_id="t-concurrent"))
+
+    assert result.visited == ["a"]
+    assert result.marker == "b"
+
+
+def test_a_failing_node_discards_the_whole_wave():
+    """All or nothing: a sibling's successful delta does not reach the state."""
+
+    async def boom(state: TrackedState) -> StateDelta:
+        raise RuntimeError("node exploded")
+
+    exporter = InMemoryExporter()
+    graph = Graph("atomic", exporter)
+    graph.add_node("ok", make_fn("ok"), writes=["visited"])
+    graph.add_node("boom", boom, writes=["marker"])
+    graph.add_node("after", set_marker, writes=["marker"])
+    graph.add_edge("ok", "after")
+    graph.add_edge("boom", "after")
+
+    result = run_graph(graph, TrackedState(trace_id="t-atomic"))
+
+    assert result.status == GraphStatus.FAILED
+    assert result.visited == []          # the sibling succeeded, its delta was dropped
+    assert result.marker is None         # the next wave never ran
+
+    events = {event.node_name: event for event in exporter.events}
+    assert set(events) == {"ok", "boom"}                  # both siblings still traced
+    assert events["ok"].status == TaskStatus.COMPLETED    # it did run, it just did not count
+    assert events["boom"].status == TaskStatus.FAILED
+    assert "node exploded" in events["boom"].error
+
+
+def test_every_sibling_finishes_even_when_one_fails():
+    """A failure does not cancel the rest of its wave."""
+    finished: list[str] = []
+
+    async def slow(state: TrackedState) -> StateDelta:
+        await asyncio.sleep(0.05)
+        finished.append("slow")
+        return {"visited": ["slow"]}
+
+    async def fails_fast(state: TrackedState) -> StateDelta:
+        raise RuntimeError("immediate")
+
+    graph = Graph("siblings", InMemoryExporter())
+    graph.add_node("slow", slow, writes=["visited"])
+    graph.add_node("fails", fails_fast, writes=["marker"])
+
+    result = run_graph(graph, TrackedState(trace_id="t-siblings"))
+
+    assert finished == ["slow"]
+    assert result.status == GraphStatus.FAILED
+
+
+def test_several_failures_in_one_wave_are_all_traced():
+    async def boom(state: TrackedState) -> StateDelta:
+        raise RuntimeError("boom")
+
+    exporter = InMemoryExporter()
+    graph = Graph("many-failures", exporter)
+    graph.add_node("one", boom, writes=["visited"])
+    graph.add_node("two", boom, writes=["marker"])
+
+    result = run_graph(graph, TrackedState(trace_id="t-many"))
+
+    assert result.status == GraphStatus.FAILED
+    assert [event.status for event in exporter.events] == [TaskStatus.FAILED, TaskStatus.FAILED]
+
+
+def test_a_wave_is_applied_in_one_validation_pass():
+    """An invalid combined result fails the wave rather than half-applying it."""
+
+    async def good(state: TrackedState) -> StateDelta:
+        return {"visited": ["good"]}
+
+    async def bad(state: TrackedState) -> StateDelta:
+        return {"marker": ["not-a-string"]}
+
+    exporter = InMemoryExporter()
+    graph = Graph("invalid-merge", exporter)
+    graph.add_node("good", good, writes=["visited"])
+    graph.add_node("bad", bad, writes=["marker"])
+
+    result = run_graph(graph, TrackedState(trace_id="t-merge"))
+
+    assert result.status == GraphStatus.FAILED
+    assert result.visited == []
+    assert all("produced an invalid state" in event.error for event in exporter.events)
 
 
 # --- declared writes --------------------------------------------------------

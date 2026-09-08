@@ -86,8 +86,8 @@ print(state.verdict)   # request-changes
 Every run leaves a trace behind:
 
 ```jsonl
-{"trace_id":"run-1","node_name":"lint","status":"completed","started_at":"...","finished_at":"...","token_usage":{},"error":null}
-{"trace_id":"run-1","node_name":"decide","status":"completed","started_at":"...","finished_at":"...","token_usage":{},"error":null}
+{"trace_id":"run-1","node_name":"lint","wave":0,"group":0,"status":"completed","started_at":"...","finished_at":"...","token_usage":{},"error":null}
+{"trace_id":"run-1","node_name":"decide","wave":1,"group":0,"status":"completed","started_at":"...","finished_at":"...","token_usage":{},"error":null}
 ```
 
 ## Core abstractions
@@ -97,7 +97,7 @@ Every run leaves a trace behind:
 | `BaseState` | The frozen Pydantic model threaded through the graph. Subclass it to declare your domain fields; `trace_id`, `created_at`, `current_node`, and `status` come for free. |
 | `Node` | One unit of work: `async run(state) -> StateDelta \| None`. It reads the whole state and returns only the fields it changed (or `None` for "nothing changed"), and can declare that write set as `writes=[...]`. Either subclass `Node[YourState]` or pass a bare async function (`NodeFunction`) — the graph accepts both. |
 | `Graph` | Registers nodes and edges, resolves execution order, runs the workflow, and emits a trace event per node. |
-| `TraceEvent` | The typed record of a single node execution: status, start/finish time, token usage, error. |
+| `TraceEvent` | The typed record of a single node execution: status, start/finish time, token usage, error, and the wave and group it ran in. |
 | `Exporter` | Where trace events go. `NoOpExporter` (default), `InMemoryExporter`, and `JSONLExporter` ship in the box; implement `emit()` for anything else. |
 
 ### Execution semantics
@@ -120,21 +120,78 @@ Every run leaves a trace behind:
   constructor cannot reach: a bare async function has nowhere to hang the declaration, and a node
   you did not write may need one supplied for it. It wins over the node's own `writes`.
 - `current_node` and `status` are owned by the graph, but a node can still end a run early by
-  returning `{"status": GraphStatus.FAILED}`.
-- Nodes run in **topological order**, derived from the edges. If several nodes have no incoming
-  edge, you must disambiguate with `set_entry_point()`; cycles are rejected up front.
-- Execution is **sequential** — v0 runs a linear pass over the sorted order. Branching, parallel
-  fan-out, and loops are not in the kernel yet (see [Roadmap](#roadmap)); an agent loop today lives
-  *inside* a single node, as the example below shows.
-- A node that raises **fails fast**: the run stops, `state.status` becomes `failed`, and the error
-  is captured on that node's `TraceEvent`.
-- `max_steps` caps how many nodes may execute, so a runaway workflow stops on your terms.
+  returning `{"status": GraphStatus.FAILED}`. Its group still finishes and is applied; the next one
+  does not start.
+- Nodes run in dependency order, in **waves** that execute concurrently — see below. Cycles are
+  rejected up front, and independent roots simply share the first wave.
+- `max_steps` caps how many nodes may execute, so a runaway workflow stops on your terms. A group
+  that would exceed the cap is not started at all, rather than half-run.
 - `Node` and `Graph` are **generic in the state type**. `Graph[ReviewState].run()` returns a
   `ReviewState`, not a `BaseState`, and `class DecideNode(Node[ReviewState])` may narrow `run`'s
   argument without violating the base signature. The type parameter is optional — omit it and you
   get the same runtime behaviour with looser types.
-- Trace events are emitted in a `finally` block — **success or failure, every executed node is
-  recorded**. An exporter that itself throws is logged and swallowed, never masking the real error.
+- **Every executed node is recorded**, success or failure. An exporter that itself throws is logged
+  and swallowed, never masking the real error.
+
+### Waves, groups, and what happens when one node fails
+
+`build()` groups nodes into **waves** by dependency depth: everything in a wave has had all of its
+predecessors run, so nothing in it depends on anything else in it. Each wave is then split into
+**groups** that are safe to run together, and the nodes of a group run **concurrently**, on
+`asyncio.gather`, against one shared snapshot of the state — no copy per node, because nodes do not
+mutate what they are given.
+
+```
+build() → [["fetch"], ["lint", "score"], ["report"]]
+           wave 0      wave 1 (parallel)   wave 2
+```
+
+Because there is no ordering within a group, two of its nodes writing the same field would make the
+winner an accident of scheduling. `build()` refuses such a graph up front:
+
+```
+SkeinGraphError: 'findings' is written by both 'lint' and 'style', which run in the
+                 same wave. Add an edge to order them, or split the field.
+```
+
+This check can only see **declared** writes. A node that declares none cannot be cleared of a
+conflict, so instead of costing its whole wave its concurrency, `build()` splits the wave into
+**groups**: the undeclared node runs alone, and everything else still runs together.
+
+```
+wave 0: [d1(log)] [opaque] [d2(log), d3(m)]
+        group 0   group 1  group 2
+```
+
+Running alone also makes an undeclared node a **barrier**: `d1` and `d2` both write `log` here
+without conflicting, because the split has already put them in a defined order.
+
+`build()` logs a warning naming the nodes, and each event records the wave and group it ran in, so
+the split is never silent — nodes sharing a `(wave, group)` really ran together:
+
+```jsonl
+{"node_name":"d1","wave":0,"group":0,"status":"completed", ...}
+{"node_name":"opaque","wave":0,"group":1,"status":"completed", ...}
+{"node_name":"d2","wave":0,"group":2,"status":"completed", ...}
+{"node_name":"d3","wave":0,"group":2,"status":"completed", ...}
+```
+
+Declaring `writes` is what keeps a node in the shared group — and turns a possible conflict from a
+split into a refusal.
+
+A group is **all or nothing**:
+
+- Siblings are never cancelled: when a node raises, the rest of its group still runs to completion.
+- If any node in the group failed, **none** of that group's deltas are applied. The run stops and
+  `status` becomes `failed`. "The whole group happened, or none of it did" is far easier to reason
+  about — and to replay — than a state holding some fraction of it.
+- Groups earlier in the plan keep their results: they are ordered relative to the failure, exactly
+  as an earlier node in a linear graph has always been.
+- Every node that ran still emits a `TraceEvent`; the failed one carries the error. A sibling that
+  succeeded is recorded as `completed` even though its delta was dropped: it really did run, and
+  the run-level `failed` status is what tells you the group was discarded.
+- Deltas within a successful group are merged and validated in a single pass, so an invalid
+  *combination* fails the group rather than half-applying it.
 
 ## Observability
 
