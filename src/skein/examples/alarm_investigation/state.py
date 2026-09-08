@@ -64,4 +64,7 @@ class AlarmInvestigationState(BaseState):
     alarm: AlarmPayload                          # input
     triage: TriageResult | None = None           # written by triage
     investigation: InvestigationResult | None = None
+    recent_changes: list[str] = Field(           # written alongside investigation
+        default_factory=list
+    )
     summary: SummaryResult | None = None

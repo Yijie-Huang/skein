@@ -223,11 +223,13 @@ python tests/export_langsmith_runs.py --trace-id <trace-id> --output runs.jsonl
 ## Example: alarm investigation
 
 [`src/skein/examples/alarm_investigation/`](src/skein/examples/alarm_investigation/) is the v0
-end-to-end flow — an AIOps triage workflow as a three-node linear DAG:
+end-to-end flow — an AIOps triage workflow as a four-node diamond:
 
 ```
-TriageNode  ──▶  InvestigationNode  ──▶  SummaryNode
- (rules)         (ReAct + MCP tool)        (rules)
+                 ┌──▶  InvestigationNode   ──┐
+TriageNode  ──▶  ┤     (ReAct + MCP tool)    ├──▶  SummaryNode
+ (rules)         └──▶  RecentChangesNode  ──┘       (rules)
+                        (deploy history)
 ```
 
 It deliberately mixes deterministic and model-driven steps, which is the point: triage and
@@ -236,19 +238,39 @@ ReAct loop against Claude with a `get_service_cpu` tool served over MCP. The mod
 parsed straight into a Pydantic `InvestigationResult`, so a malformed response is caught at the
 node boundary.
 
+The two middle nodes depend only on triage, so they share a wave and run concurrently — and because
+both declare their `writes`, they stay in one group. The trace shows it: they carry the same
+`(wave, group)`, and the cheap one finishes entirely inside the LLM call's window.
+
+```
+Node: triage,         wave=0 group=0, Started: ...:06.835, Finished: ...:06.836
+Node: investigation,  wave=1 group=0, Started: ...:06.836, Finished: ...:18.057
+Node: recent_changes, wave=1 group=0, Started: ...:07.237, Finished: ...:07.439
+Node: summary,        wave=2 group=0, Started: ...:18.057, Finished: ...:18.058
+```
+
+`SummaryNode` then reads both branches, so its verdict cites the root cause *and* the change count.
+
 ```bash
 python -m skein.examples.alarm_investigation.graph                                   # run the workflow
 pip install -e ".[mcp]" && python -m skein.examples.alarm_investigation.mcp_server   # serve the tool
 ```
 
 The investigation node needs `ANTHROPIC_API_KEY`. Without it the run stops at that node and the
-trace says why, rather than failing somewhere downstream:
+trace says why, rather than failing somewhere downstream — and it doubles as a live demonstration
+of the group semantics:
 
 ```
 Run failed: ANTHROPIC_API_KEY is not set. The investigation node calls Claude directly — ...
-Node: triage,        Status: TaskStatus.COMPLETED
-Node: investigation, Status: TaskStatus.FAILED
+Node: triage,         wave=0 group=0, Status: TaskStatus.COMPLETED
+Node: investigation,  wave=1 group=0, Status: TaskStatus.FAILED
+  error: ANTHROPIC_API_KEY is not set. ...
+Node: recent_changes, wave=1 group=0, Status: TaskStatus.COMPLETED
 ```
+
+`recent_changes` still ran to completion and is recorded as such — a failing sibling never cancels
+it. But its delta was dropped along with the rest of the group, `summary` never started, and the
+run is `failed`.
 
 The `mcp` extra is optional: without it the tool call falls back to the same synthetic metric
 lookup in-process, so that half of the demo still runs.

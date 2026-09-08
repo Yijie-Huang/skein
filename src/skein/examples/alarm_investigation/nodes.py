@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
@@ -385,7 +386,31 @@ class TriageNode(Node[AlarmInvestigationState]):
             severity = "medium" if alarm.value > 0.6 else "low"
         alarm_type: AlarmType = "latency" if "latency" in alarm.rule_name else "unknown"
         return {"triage": TriageResult(severity=severity, alarm_type=alarm_type)}
-    
+
+
+_RECENT_DEPLOYS = {
+    "service-a": ["deploy 4f2a1c at 09:12", "config change: pool_size 20 -> 8 at 09:20"],
+    "service-b": ["deploy 91be07 at 08:40"],
+}
+
+
+class RecentChangesNode(Node[AlarmInvestigationState]):
+    """Pull the change log for the alarmed service.
+
+    Deliberately trivial and LLM-free: it depends only on triage, exactly as the
+    investigation does, so the two share a wave and run concurrently.
+    """
+
+    def __init__(self):
+        super().__init__("recent_changes", writes=["recent_changes"])
+
+    async def run(self, state: AlarmInvestigationState) -> StateDelta:
+        service = state.alarm.services[0] if state.alarm.services else "unknown-service"
+        print(f"[RecentChangesNode] Looking up recent changes for {service}")
+        await asyncio.sleep(0.2)  # stand-in for a deploy-history API
+        return {"recent_changes": _RECENT_DEPLOYS.get(service, [])}
+
+
 class InvestigationNode(Node[AlarmInvestigationState]):
     """Investigation node for alarm investigation workflow."""
 
@@ -425,6 +450,9 @@ class SummaryNode(Node[AlarmInvestigationState]):
         else:
             status = "pending"
             reason = "Insufficient evidence to determine root cause"
+        # Both branches of the wave land here, so the summary can use either.
+        if state.recent_changes:
+            reason += f" ({len(state.recent_changes)} recent change(s) near the alarm)"
         return {
             "summary": SummaryResult(
                 summary="Alarm investigation completed", status=status, reason=reason

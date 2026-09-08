@@ -7,7 +7,7 @@ from skein.core.graph import Graph
 from skein.core.state import GraphStatus
 from skein.exporters.memory import InMemoryExporter
 
-from .nodes import InvestigationNode, SummaryNode, TriageNode
+from .nodes import InvestigationNode, RecentChangesNode, SummaryNode, TriageNode
 from .state import AlarmInvestigationState, AlarmPayload
 
 
@@ -17,9 +17,14 @@ class AlarmInvestigationGraph(Graph[AlarmInvestigationState]):
         super().__init__("Alarm Investigation Workflow", InMemoryExporter())
         self.add_node("triage", TriageNode())
         self.add_node("investigation", InvestigationNode())
+        self.add_node("recent_changes", RecentChangesNode())
         self.add_node("summary", SummaryNode())
+        # investigation and recent_changes both depend only on triage, so they
+        # share a wave and run concurrently.
         self.add_edge("triage", "investigation")
+        self.add_edge("triage", "recent_changes")
         self.add_edge("investigation", "summary")
+        self.add_edge("recent_changes", "summary")
         self.set_entry_point("triage")
     
     async def investigate_alarm(self, alarm: AlarmPayload):
@@ -33,8 +38,11 @@ class AlarmInvestigationGraph(Graph[AlarmInvestigationState]):
         if isinstance(exporter, InMemoryExporter):
             print("Execution trace:")
             for event in exporter.events:
+                # Nodes sharing a (wave, group) ran concurrently — compare the
+                # timestamps of investigation and recent_changes to see it.
                 print(
-                    f"Node: {event.node_name}, Status: {event.status}, "
+                    f"Node: {event.node_name}, wave={event.wave} group={event.group}, "
+                    f"Status: {event.status}, "
                     f"Started at: {event.started_at}, Finished at: {event.finished_at}"
                 )
                 if event.error:

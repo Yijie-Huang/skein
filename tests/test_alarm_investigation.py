@@ -12,6 +12,7 @@ from skein.examples.alarm_investigation.graph import AlarmInvestigationGraph
 from skein.examples.alarm_investigation.nodes import (
     InvestigationNode,
     InvestigationUnavailable,
+    RecentChangesNode,
     SummaryNode,
     TriageNode,
 )
@@ -103,6 +104,39 @@ def test_summary_marks_a_confident_result_resolved():
     assert "cpu saturation" in summary.reason
 
 
+def test_recent_changes_runs_without_an_api_key():
+    """The parallel branch is deliberately LLM-free."""
+    delta = asyncio.run(RecentChangesNode().run(make_state()))
+
+    assert delta["recent_changes"] == [
+        "deploy 4f2a1c at 09:12",
+        "config change: pool_size 20 -> 8 at 09:20",
+    ]
+
+
+def test_summary_folds_in_the_parallel_branch():
+    state = make_state(
+        investigation=InvestigationResult(
+            root_cause="cpu saturation", category="resource_exhaustion", confidence=0.9
+        ),
+        recent_changes=["deploy 4f2a1c at 09:12"],
+    )
+
+    summary = asyncio.run(SummaryNode().run(state))["summary"]
+
+    assert "1 recent change(s)" in summary.reason
+
+
+def test_investigation_and_recent_changes_share_a_wave():
+    plan = AlarmInvestigationGraph().plan
+
+    assert [(entry.wave, entry.group, entry.names) for entry in plan] == [
+        (0, 0, ["triage"]),
+        (1, 0, ["investigation", "recent_changes"]),
+        (2, 0, ["summary"]),
+    ]
+
+
 def test_summary_stays_pending_when_confidence_is_low():
     state = make_state(
         investigation=InvestigationResult(category="unknown", confidence=0.4)
@@ -124,6 +158,15 @@ def test_graph_run_without_api_key_fails_with_the_reason_in_the_trace(no_api_key
     assert result.investigation is None
     assert result.summary is None               # summary never ran, no AttributeError
 
+    # recent_changes shares investigation's wave: it is not cancelled by the
+    # failure, but its delta goes down with the group.
     events = graph.exporter.events
-    assert [event.node_name for event in events] == ["triage", "investigation"]
-    assert "ANTHROPIC_API_KEY is not set" in events[-1].error
+    assert [event.node_name for event in events] == [
+        "triage",
+        "investigation",
+        "recent_changes",
+    ]
+    assert result.recent_changes == []
+    errors = {event.node_name: event.error for event in events}
+    assert "ANTHROPIC_API_KEY is not set" in errors["investigation"]
+    assert errors["recent_changes"] is None
